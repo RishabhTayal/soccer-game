@@ -30,11 +30,12 @@
     image-rendering: auto;
     cursor: pointer;
     box-shadow: 0 0 0 2px #1a4a22, 0 12px 48px rgba(0,0,0,.55);
+    outline: none;
   }
 </style>
 </head>
 <body>
-<div id="wrap"><canvas id="c" width="960" height="540"></canvas></div>
+<div id="wrap"><canvas id="c" width="960" height="540" tabindex="0"></canvas></div>
 <script>
 (() => {
   "use strict";
@@ -83,15 +84,14 @@
   const CHARGE_TIME = 0.55;
   const BOUNCE = 0.72;
   const WALL_BOUNCE = 0.78;
-  const MATCH_TIME = 180;
-  const AI_MAX = 214;
-  const AI_SPRINT = 252;
+  const HALF_TIME = 120; // 2 minutes per half
 
   // ── State ──────────────────────────────────────────────
   const keys = Object.create(null);
-  let state = "title"; // title | play | goal | over
+  let state = "setup"; // setup | play | goal | halftime | over
   let scoreH = 0, scoreA = 0;
-  let timeLeft = MATCH_TIME;
+  let timeLeft = HALF_TIME;
+  let currentHalf = 1; // 1 or 2
   let goalFlash = 0;
   let goalText = "";
   let lastScorer = null;
@@ -99,41 +99,118 @@
   let charge = 0;
   let charging = false;
   let kickCool = 0;
-  let aiKickCool = 0;
-  let aiCharge = 0;
   let shake = 0;
   let titlePulse = 0;
   let audioOk = false;
   let ac = null;
   let inputLock = 0;
 
-  const home = { x: 0, y: 0, vx: 0, vy: 0, facing: 0, sprint: false, num: "10" };
-  const away = { x: 0, y: 0, vx: 0, vy: 0, facing: Math.PI, sprint: false, num: "9" };
-  const ball = { x: 0, y: 0, vx: 0, vy: 0, rot: 0 };
+  // Setup choices
+  let selectedTeam = "home"; // "home" or "away"
+  let selectedDifficulty = "normal"; // "easy", "normal", "hard"
+  let setupPhase = "team"; // "team", "difficulty"
+
+  // Difficulty multipliers
+  const DIFFICULTY = {
+    easy: { aiSpd: 0.7, aiAggr: 0.6, aiAcc: 0.7 },
+    normal: { aiSpd: 1.0, aiAggr: 1.0, aiAcc: 1.0 },
+    hard: { aiSpd: 1.25, aiAggr: 1.4, aiAcc: 1.3 }
+  };
+
+  // Players - 5v5 setup
+  let homePlayers = [];
+  let awayPlayers = [];
+  let controlledPlayer = null;
+  let ball = { x: 0, y: 0, vx: 0, vy: 0, rot: 0 };
+
+  function createPlayer(team, num, x, y) {
+    return {
+      team,
+      num: String(num),
+      x, y,
+      vx: 0, vy: 0,
+      facing: team === "home" ? 0 : Math.PI,
+      sprint: false,
+      kickCool: 0,
+      aiCharge: 0,
+      aiTarget: null
+    };
+  }
 
   // ── Input ──────────────────────────────────────────────
   const down = (e) => {
     keys[e.code] = true;
     if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) e.preventDefault();
-    if ((state === "title" || state === "over") && (e.code === "Space" || e.code === "Enter")) {
+    
+    if (state === "setup") {
+      if (setupPhase === "team") {
+        if (e.code === "ArrowLeft" || e.code === "KeyA") selectedTeam = "home";
+        if (e.code === "ArrowRight" || e.code === "KeyD") selectedTeam = "away";
+        if (e.code === "Space" || e.code === "Enter") {
+          setupPhase = "difficulty";
+          keys.Space = false;
+          e.preventDefault();
+        }
+      } else if (setupPhase === "difficulty") {
+        if (e.code === "ArrowLeft" || e.code === "KeyA") {
+          if (selectedDifficulty === "normal") selectedDifficulty = "easy";
+          else if (selectedDifficulty === "hard") selectedDifficulty = "normal";
+        }
+        if (e.code === "ArrowRight" || e.code === "KeyD") {
+          if (selectedDifficulty === "easy") selectedDifficulty = "normal";
+          else if (selectedDifficulty === "normal") selectedDifficulty = "hard";
+        }
+        if (e.code === "Space" || e.code === "Enter") {
+          keys.Space = false;
+          startMatch();
+          e.preventDefault();
+        }
+      }
+    } else if (state === "halftime" && (e.code === "Space" || e.code === "Enter")) {
       keys.Space = false;
-      startMatch();
-      return;
+      startSecondHalf();
+      e.preventDefault();
+    } else if (state === "over" && (e.code === "Space" || e.code === "Enter")) {
+      keys.Space = false;
+      backToSetup();
+      e.preventDefault();
     }
   };
+
   const up = (e) => {
     keys[e.code] = false;
     if (e.code === "Space" && state === "play" && charging && inputLock <= 0) {
-      doKick(home, charge);
+      doKick(controlledPlayer, charge);
       charging = false;
       charge = 0;
     }
   };
+
   window.addEventListener("keydown", down);
   window.addEventListener("keyup", up);
+
+  // Focus canvas on click and handle setup/over states
   canvas.addEventListener("mousedown", () => {
-    if (state === "title" || state === "over") startMatch();
+    canvas.focus();
+    if (state === "setup") {
+      if (setupPhase === "team") {
+        setupPhase = "difficulty";
+      } else {
+        startMatch();
+      }
+    } else if (state === "halftime") {
+      startSecondHalf();
+    } else if (state === "over") {
+      backToSetup();
+    }
   });
+
+  // Ensure canvas is focused on page load
+  canvas.focus();
+  canvas.addEventListener("focus", () => {
+    canvas.style.boxShadow = "0 0 0 2px #1a4a22, 0 12px 48px rgba(0,0,0,.55)";
+  });
+
   window.addEventListener("blur", () => {
     for (const k of Object.keys(keys)) keys[k] = false;
     charging = false;
@@ -181,35 +258,101 @@
   const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
   const ang = (x, y) => Math.atan2(y, x);
 
+  function initTeams() {
+    homePlayers = [];
+    awayPlayers = [];
+
+    // 5v5 formation: GK, 2 defenders, 2 midfielders (one controlled if user picked home)
+    const homeNums = ["1", "5", "3", "8", "10"];
+    const awayNums = ["1", "4", "6", "7", "9"];
+    
+    // Home formation (attacking right initially)
+    const homeXBase = [0.15, 0.28, 0.28, 0.42, 0.42];
+    const homeY = [0.5, 0.3, 0.7, 0.35, 0.65];
+    
+    for (let i = 0; i < 5; i++) {
+      const px = PITCH.x + PITCH.w * homeXBase[i];
+      const py = PITCH.y + PITCH.h * homeY[i];
+      homePlayers.push(createPlayer("home", homeNums[i], px, py));
+    }
+
+    // Away formation (attacking left initially)
+    const awayXBase = [0.85, 0.72, 0.72, 0.58, 0.58];
+    const awayY = [0.5, 0.3, 0.7, 0.35, 0.65];
+    
+    for (let i = 0; i < 5; i++) {
+      const px = PITCH.x + PITCH.w * awayXBase[i];
+      const py = PITCH.y + PITCH.h * awayY[i];
+      awayPlayers.push(createPlayer("away", awayNums[i], px, py));
+    }
+
+    // Set controlled player (midfielder - index 3)
+    if (selectedTeam === "home") {
+      controlledPlayer = homePlayers[3];
+    } else {
+      controlledPlayer = awayPlayers[3];
+    }
+  }
+
   function resetPositions(kickoffTo) {
-    home.x = PITCH.x + PITCH.w * 0.32;
-    home.y = PITCH.y + PITCH.h * 0.5;
-    home.vx = home.vy = 0;
-    home.facing = 0;
-    away.x = PITCH.x + PITCH.w * 0.68;
-    away.y = PITCH.y + PITCH.h * 0.5;
-    away.vx = away.vy = 0;
-    away.facing = Math.PI;
+    const halfProgress = currentHalf === 2 ? 1 : 0;
+    
+    // Reset all players to formation positions
+    const homeXBase = halfProgress ? [0.85, 0.72, 0.72, 0.58, 0.58] : [0.15, 0.28, 0.28, 0.42, 0.42];
+    const homeY = [0.5, 0.3, 0.7, 0.35, 0.65];
+    
+    for (let i = 0; i < homePlayers.length; i++) {
+      homePlayers[i].x = PITCH.x + PITCH.w * homeXBase[i];
+      homePlayers[i].y = PITCH.y + PITCH.h * homeY[i];
+      homePlayers[i].vx = homePlayers[i].vy = 0;
+      homePlayers[i].facing = halfProgress ? Math.PI : 0;
+      homePlayers[i].kickCool = 0;
+      homePlayers[i].aiCharge = 0;
+    }
+
+    const awayXBase = halfProgress ? [0.15, 0.28, 0.28, 0.42, 0.42] : [0.85, 0.72, 0.72, 0.58, 0.58];
+    const awayY = [0.5, 0.3, 0.7, 0.35, 0.65];
+    
+    for (let i = 0; i < awayPlayers.length; i++) {
+      awayPlayers[i].x = PITCH.x + PITCH.w * awayXBase[i];
+      awayPlayers[i].y = PITCH.y + PITCH.h * awayY[i];
+      awayPlayers[i].vx = awayPlayers[i].vy = 0;
+      awayPlayers[i].facing = halfProgress ? 0 : Math.PI;
+      awayPlayers[i].kickCool = 0;
+      awayPlayers[i].aiCharge = 0;
+    }
+
     ball.x = PITCH.x + PITCH.w * 0.5;
     ball.y = PITCH.y + PITCH.h * 0.5;
     ball.vx = ball.vy = 0;
     ball.rot = 0;
     charge = 0;
     charging = false;
-    aiCharge = 0;
+
     if (kickoffTo === "home") {
-      ball.x -= 8;
+      ball.x -= halfProgress ? 8 : -8;
     } else if (kickoffTo === "away") {
-      ball.x += 8;
+      ball.x += halfProgress ? 8 : -8;
     }
+  }
+
+  function backToSetup() {
+    state = "setup";
+    setupPhase = "team";
+    selectedTeam = "home";
+    selectedDifficulty = "normal";
+    canvas.focus();
   }
 
   function startMatch() {
     ensureAudio();
     if (ac && ac.state === "suspended") ac.resume().catch(() => {});
+    
+    initTeams();
     scoreH = 0;
     scoreA = 0;
-    timeLeft = MATCH_TIME;
+    currentHalf = 1;
+    timeLeft = HALF_TIME;
     particles = [];
     goalFlash = 0;
     shake = 0;
@@ -221,6 +364,20 @@
     charging = false;
     charge = 0;
     sfxWhistle();
+    canvas.focus();
+  }
+
+  function startSecondHalf() {
+    currentHalf = 2;
+    timeLeft = HALF_TIME;
+    resetPositions();
+    state = "play";
+    inputLock = 0.28;
+    keys.Space = false;
+    charging = false;
+    charge = 0;
+    sfxWhistle();
+    canvas.focus();
   }
 
   function spawnBurst(x, y, color, n) {
@@ -248,7 +405,10 @@
     goalFlash = 1.35;
     shake = 10;
     state = "goal";
-    const gx = who === "home" ? AWAY_GOAL.x : HOME_GOAL.x + HOME_GOAL.w;
+    const halfProgress = currentHalf === 2 ? 1 : 0;
+    const gx = who === "home" ? 
+      (halfProgress ? HOME_GOAL.x : AWAY_GOAL.x + AWAY_GOAL.w) :
+      (halfProgress ? AWAY_GOAL.x + AWAY_GOAL.w : HOME_GOAL.x);
     const gy = PITCH.y + PITCH.h / 2;
     spawnBurst(gx, gy, "#fff8c8", 42);
     spawnBurst(gx, gy, who === "home" ? "#6aa8ff" : "#ff7a7a", 22);
@@ -257,8 +417,13 @@
 
   function afterGoal() {
     if (timeLeft <= 0) {
-      state = "over";
-      sfxWhistle();
+      if (currentHalf === 1) {
+        state = "halftime";
+        sfxWhistle();
+      } else {
+        state = "over";
+        sfxWhistle();
+      }
       return;
     }
     resetPositions(lastScorer === "home" ? "away" : "home");
@@ -268,7 +433,7 @@
   // ── Physics ─────────────────────────────────────────────
   function movePlayer(p, ix, iy, sprint, maxSpd, dt) {
     const acc = sprint ? SPRINT_ACCEL : ACCEL;
-    const cap = sprint ? (p === away ? AI_SPRINT : SPRINT_SPD) : maxSpd;
+    const cap = sprint ? SPRINT_SPD : maxSpd;
     if (ix || iy) {
       const n = len(ix, iy) || 1;
       p.vx += (ix / n) * acc * dt;
@@ -296,21 +461,26 @@
     if (p.y > maxY) { p.y = maxY; p.vy *= -0.3; }
   }
 
-  function collidePlayers(a, b) {
-    const dx = b.x - a.x, dy = b.y - a.y;
-    const d = Math.hypot(dx, dy);
-    const min = PLAYER_R * 2;
-    if (d < min && d > 0.001) {
-      const nx = dx / d, ny = dy / d;
-      const overlap = (min - d) * 0.5;
-      a.x -= nx * overlap; a.y -= ny * overlap;
-      b.x += nx * overlap; b.y += ny * overlap;
-      const rvx = b.vx - a.vx, rvy = b.vy - a.vy;
-      const vn = rvx * nx + rvy * ny;
-      if (vn < 0) {
-        const j = vn * 0.85;
-        a.vx += j * nx; a.vy += j * ny;
-        b.vx -= j * nx; b.vy -= j * ny;
+  function collidePlayers(players) {
+    for (let i = 0; i < players.length; i++) {
+      for (let j = i + 1; j < players.length; j++) {
+        const a = players[i], b = players[j];
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const d = Math.hypot(dx, dy);
+        const min = PLAYER_R * 2;
+        if (d < min && d > 0.001) {
+          const nx = dx / d, ny = dy / d;
+          const overlap = (min - d) * 0.5;
+          a.x -= nx * overlap; a.y -= ny * overlap;
+          b.x += nx * overlap; b.y += ny * overlap;
+          const rvx = b.vx - a.vx, rvy = b.vy - a.vy;
+          const vn = rvx * nx + rvy * ny;
+          if (vn < 0) {
+            const j = vn * 0.85;
+            a.vx += j * nx; a.vy += j * ny;
+            b.vx -= j * nx; b.vy -= j * ny;
+          }
+        }
       }
     }
   }
@@ -356,19 +526,29 @@
     if (ball.y < top) { ball.y = top; ball.vy = Math.abs(ball.vy) * WALL_BOUNCE; }
     if (ball.y > bot) { ball.y = bot; ball.vy = -Math.abs(ball.vy) * WALL_BOUNCE; }
 
-    // Left side — open at the home goal mouth
+    // Goals are fixed - HOME on left, AWAY on right
+    // In second half, teams switch ends, so scoring logic adjusts
+    const halfProgress = currentHalf === 2;
+    
+    // Left side — home goal
     if (ball.x < left) {
       if (inGoalMouth(ball.x, ball.y, HOME_GOAL)) {
-        if (ball.x < HOME_GOAL.x + BALL_R) scoreGoal("away");
+        if (ball.x < HOME_GOAL.x + BALL_R) {
+          // Ball entered left goal
+          scoreGoal(halfProgress ? "home" : "away");
+        }
       } else {
         ball.x = left;
         ball.vx = Math.abs(ball.vx) * WALL_BOUNCE;
       }
     }
-    // Right side — open at the away goal mouth
+    // Right side — away goal
     if (ball.x > right) {
       if (inGoalMouth(ball.x, ball.y, AWAY_GOAL)) {
-        if (ball.x > AWAY_GOAL.x + AWAY_GOAL.w - BALL_R) scoreGoal("home");
+        if (ball.x > AWAY_GOAL.x + AWAY_GOAL.w - BALL_R) {
+          // Ball entered right goal
+          scoreGoal(halfProgress ? "away" : "home");
+        }
       } else {
         ball.x = right;
         ball.vx = -Math.abs(ball.vx) * WALL_BOUNCE;
@@ -409,9 +589,8 @@
   }
 
   function doKick(p, pow) {
-    if (dist(p, ball) > KICK_RANGE + 6) return;
+    if (!p || dist(p, ball) > KICK_RANGE + 6) return;
     const pwr = KICK_MIN + (KICK_MAX - KICK_MIN) * clamp(pow, 0.18, 1);
-    // Mix facing direction with player-to-ball so it feels aimed
     const toBx = ball.x - p.x, toBy = ball.y - p.y;
     const td = Math.hypot(toBx, toBy) || 1;
     const fx = Math.cos(p.facing), fy = Math.sin(p.facing);
@@ -425,105 +604,178 @@
     p.vy -= dy * 40;
     spawnBurst(ball.x, ball.y, "rgba(255,255,255,0.85)", 6);
     sfxKick(pow);
-    if (p === home) kickCool = 0.16;
-    else aiKickCool = 0.2;
+    p.kickCool = p === controlledPlayer ? 0.16 : 0.2;
   }
 
   // ── AI ────────────────────────────────────────────────
   function updateAI(dt) {
-    const midX = PITCH.x + PITCH.w * 0.5;
-    const myGoalX = PITCH.x + PITCH.w - 8;
-    const oppGoalX = PITCH.x + 8;
-    const goalY = PITCH.y + PITCH.h * 0.5;
+    const diff = DIFFICULTY[selectedDifficulty];
+    const baseMaxSpd = 214 * diff.aiSpd;
+    const baseSprintSpd = 252 * diff.aiSpd;
 
-    // Predict ball
-    const look = 0.28;
-    const px = ball.x + ball.vx * look;
-    const py = ball.y + ball.vy * look;
+    const allPlayers = [...homePlayers, ...awayPlayers];
+    const halfProgress = currentHalf === 2;
 
-    const dBall = dist(away, ball);
-    const ballInMyHalf = ball.x > midX - 20;
-    const approachingMyGoal = ball.vx > 30 && ball.x > midX;
-    const Icloser = dBall < dist(home, ball) - 8;
+    // Process each AI player
+    for (const p of allPlayers) {
+      if (p === controlledPlayer) continue; // Skip human-controlled player
 
-    let tx, ty, wantKick = false, wantSprint = false, aimKick = false;
+      const isHome = p.team === "home";
+      const myGoalX = halfProgress ? 
+        (isHome ? PITCH.x + PITCH.w - 8 : PITCH.x + 8) :
+        (isHome ? PITCH.x + 8 : PITCH.x + PITCH.w - 8);
+      const oppGoalX = halfProgress ?
+        (isHome ? PITCH.x + 8 : PITCH.x + PITCH.w - 8) :
+        (isHome ? PITCH.x + PITCH.w - 8 : PITCH.x + 8);
+      const goalY = PITCH.y + PITCH.h * 0.5;
+      const midX = PITCH.x + PITCH.w * 0.5;
 
-    if (dBall < KICK_RANGE + 4) {
-      // Position / shoot
-      const toGoalX = oppGoalX - away.x;
-      const toGoalY = goalY - away.y;
-      away.facing = ang(toGoalX, toGoalY);
-      // Get behind the ball relative to opponent goal
-      const behind = 16;
-      const gx = oppGoalX - ball.x, gy = goalY - ball.y;
-      const gn = Math.hypot(gx, gy) || 1;
-      tx = ball.x - (gx / gn) * behind;
-      ty = ball.y - (gy / gn) * behind;
+      // Predict ball position
+      const look = 0.28;
+      const px = ball.x + ball.vx * look;
+      const py = ball.y + ball.vy * look;
 
-      const aligned = (gx / gn) * Math.cos(away.facing) + (gy / gn) * Math.sin(away.facing);
-      const ballToGoal = Math.hypot(ball.x - oppGoalX, ball.y - goalY);
-      if (ball.x < midX + 80 || ballToGoal < 260) {
-        wantKick = true;
-        aimKick = true;
-        aiCharge = Math.min(1, aiCharge + dt / 0.38);
-      } else if (Icloser) {
-        // Drive it forward with a lighter tap
-        wantKick = aiCharge > 0.25;
-        aiCharge = Math.min(0.55, aiCharge + dt / 0.5);
+      const dBall = dist(p, ball);
+      const ballInMyHalf = halfProgress ?
+        (isHome ? ball.x > midX : ball.x < midX) :
+        (isHome ? ball.x < midX : ball.x > midX);
+
+      // Find closest teammate and opponent to ball
+      let closestTeammate = null;
+      let closestTeammateDist = Infinity;
+      let closestOpp = null;
+      let closestOppDist = Infinity;
+
+      for (const other of allPlayers) {
+        if (other === p) continue;
+        const d = dist(other, ball);
+        if (other.team === p.team) {
+          if (d < closestTeammateDist) {
+            closestTeammateDist = d;
+            closestTeammate = other;
+          }
+        } else {
+          if (d < closestOppDist) {
+            closestOppDist = d;
+            closestOpp = other;
+          }
+        }
       }
-    } else if (approachingMyGoal || (ballInMyHalf && !Icloser && ball.x > midX + 100)) {
-      // Defend: intercept between ball and goal
-      const gx = myGoalX, gy = goalY;
-      tx = ball.x * 0.55 + gx * 0.45 + ball.vx * 0.12;
-      ty = ball.y * 0.62 + gy * 0.38 + ball.vy * 0.12;
-      wantSprint = dBall > 90;
-      aiCharge = 0;
-    } else {
-      // Chase / intercept
-      tx = px;
-      ty = py;
-      // Bias slightly toward getting behind the ball
-      if (ball.x < away.x) tx -= 10;
-      wantSprint = dBall > 70 || len(ball.vx, ball.vy) > 160;
-      aiCharge = 0;
-    }
 
-    tx = clamp(tx, PITCH.x + 22, PITCH.x + PITCH.w - 22);
-    ty = clamp(ty, PITCH.y + 22, PITCH.y + PITCH.h - 22);
+      const IamClosest = dBall < closestTeammateDist - 12;
+      
+      let tx, ty, wantKick = false, wantSprint = false;
 
-    let ix = tx - away.x, iy = ty - away.y;
-    const id = Math.hypot(ix, iy);
-    if (id < 6) { ix = 0; iy = 0; }
+      // Role-based behavior (GK = #1, others are outfield)
+      const isGK = p.num === "1";
 
-    movePlayer(away, ix, iy, wantSprint, AI_MAX, dt);
+      if (isGK) {
+        // Goalkeeper: stay near goal, intercept if ball comes close
+        if (dBall < 140 && ballInMyHalf) {
+          tx = ball.x * 0.4 + myGoalX * 0.6;
+          ty = ball.y * 0.7 + goalY * 0.3;
+          wantSprint = dBall < 80;
+          if (dBall < KICK_RANGE + 8) {
+            wantKick = true;
+            p.aiCharge = Math.min(0.8, p.aiCharge + dt / 0.4);
+            p.facing = ang(oppGoalX - p.x, goalY - p.y);
+          }
+        } else {
+          // Stay in goal area
+          tx = myGoalX;
+          ty = goalY;
+        }
+      } else {
+        // Outfield player
+        if (dBall < KICK_RANGE + 4 && IamClosest) {
+          // I have the ball - dribble or shoot
+          const toGoalX = oppGoalX - p.x;
+          const toGoalY = goalY - p.y;
+          p.facing = ang(toGoalX, toGoalY);
+          
+          // Get behind ball
+          const behind = 16;
+          const gx = oppGoalX - ball.x, gy = goalY - ball.y;
+          const gn = Math.hypot(gx, gy) || 1;
+          tx = ball.x - (gx / gn) * behind;
+          ty = ball.y - (gy / gn) * behind;
 
-    if (aimKick || (dBall < KICK_RANGE)) {
-      const toGoal = ang(oppGoalX - away.x, goalY - away.y);
-      away.facing = toGoal;
-    } else if (ix || iy) {
-      away.facing = ang(ix, iy);
-    }
+          const distToGoal = Math.hypot(ball.x - oppGoalX, ball.y - goalY);
+          const attacking = halfProgress ?
+            (isHome ? ball.x < midX + 100 : ball.x > midX - 100) :
+            (isHome ? ball.x > midX - 100 : ball.x < midX + 100);
 
-    aiKickCool = Math.max(0, aiKickCool - dt);
-    if (wantKick && aiKickCool <= 0 && dBall < KICK_RANGE + 2) {
-      if (aiCharge >= 0.42 || (dBall < KICK_RANGE - 2 && aiCharge > 0.18)) {
-        doKick(away, Math.max(0.45, aiCharge));
-        aiCharge = 0;
+          if (attacking || distToGoal < 260) {
+            wantKick = true;
+            p.aiCharge = Math.min(1, p.aiCharge + dt / (0.38 * diff.aiAggr));
+          } else if (IamClosest) {
+            wantKick = p.aiCharge > 0.25;
+            p.aiCharge = Math.min(0.55, p.aiCharge + dt / 0.5);
+          }
+        } else if (IamClosest && dBall < 90) {
+          // Chase ball
+          tx = px;
+          ty = py;
+          wantSprint = dBall > 50 || len(ball.vx, ball.vy) > 160;
+          p.aiCharge = 0;
+        } else if (ballInMyHalf && dBall < 180 * diff.aiAggr) {
+          // Defensive positioning
+          tx = ball.x * 0.45 + myGoalX * 0.55;
+          ty = ball.y * 0.6 + goalY * 0.4;
+          wantSprint = dBall < 70 && closestOppDist < dBall;
+          p.aiCharge = 0;
+        } else {
+          // Supporting position - spread out
+          const attackSide = halfProgress ? (isHome ? -1 : 1) : (isHome ? 1 : -1);
+          const supportX = ball.x + attackSide * 90;
+          const supportY = p.y; // Maintain lane
+          tx = supportX * 0.7 + p.x * 0.3;
+          ty = supportY * 0.8 + ball.y * 0.2;
+          p.aiCharge = 0;
+        }
+      }
+
+      tx = clamp(tx, PITCH.x + 22, PITCH.x + PITCH.w - 22);
+      ty = clamp(ty, PITCH.y + 22, PITCH.y + PITCH.h - 22);
+
+      let ix = tx - p.x, iy = ty - p.y;
+      const id = Math.hypot(ix, iy);
+      if (id < 6) { ix = 0; iy = 0; }
+
+      movePlayer(p, ix, iy, wantSprint, baseMaxSpd, dt);
+
+      if (ix || iy) {
+        p.facing = ang(ix, iy);
+      }
+      if (wantKick && dBall < KICK_RANGE + 3) {
+        const toGoal = ang(oppGoalX - p.x, goalY - p.y);
+        p.facing = toGoal;
+      }
+
+      p.kickCool = Math.max(0, p.kickCool - dt);
+      if (wantKick && p.kickCool <= 0 && dBall < KICK_RANGE + 2) {
+        if (p.aiCharge >= 0.42 * diff.aiAcc || (dBall < KICK_RANGE - 2 && p.aiCharge > 0.18)) {
+          doKick(p, Math.max(0.45, p.aiCharge));
+          p.aiCharge = 0;
+        }
       }
     }
   }
 
   // ── Human ──────────────────────────────────────────────
   function updateHuman(dt) {
+    if (!controlledPlayer) return;
     if (inputLock > 0) inputLock -= dt;
+    
     let ix = 0, iy = 0;
     if (keys.KeyA || keys.ArrowLeft) ix -= 1;
     if (keys.KeyD || keys.ArrowRight) ix += 1;
     if (keys.KeyW || keys.ArrowUp) iy -= 1;
     if (keys.KeyS || keys.ArrowDown) iy += 1;
+    
     const sprint = !!(keys.ShiftLeft || keys.ShiftRight);
-    home.sprint = sprint;
-    movePlayer(home, ix, iy, sprint, MAX_SPD, dt);
+    controlledPlayer.sprint = sprint;
+    movePlayer(controlledPlayer, ix, iy, sprint, MAX_SPD, dt);
 
     kickCool = Math.max(0, kickCool - dt);
     if (keys.Space && state === "play" && inputLock <= 0) {
@@ -533,7 +785,7 @@
       }
       if (charging) charge = Math.min(1, charge + dt / CHARGE_TIME);
       if (charging && charge >= 1) {
-        doKick(home, 1);
+        doKick(controlledPlayer, 1);
         charging = false;
         charge = 0;
       }
@@ -685,13 +937,28 @@
     ctx.beginPath(); ctx.arc(PITCH.x + (side === "L" ? 0 : PITCH.w), g.y + g.h, 3.6, 0, Math.PI * 2); ctx.fill();
   }
 
-  function drawPlayer(p, color, accent) {
+  function drawPlayer(p, color, accent, isControlled) {
     // Shadow
     ctx.save();
     ctx.fillStyle = "rgba(0,0,0,0.32)";
     ctx.beginPath();
     ctx.ellipse(p.x + 1, p.y + PLAYER_R + 1, PLAYER_R * 0.86, 4.2, 0, 0, Math.PI * 2);
     ctx.fill();
+
+    // Controlled player highlight ring
+    if (isControlled) {
+      ctx.strokeStyle = "rgba(255,255,100,0.75)";
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, PLAYER_R + 5, 0, Math.PI * 2);
+      ctx.stroke();
+      
+      ctx.strokeStyle = "rgba(255,255,255,0.45)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, PLAYER_R + 8, 0, Math.PI * 2);
+      ctx.stroke();
+    }
 
     // Body
     const grd = ctx.createRadialGradient(p.x - 4, p.y - 5, 2, p.x, p.y, PLAYER_R + 1);
@@ -801,13 +1068,21 @@
     ctx.font = "bold 26px Trebuchet MS, sans-serif";
     ctx.fillText(String(scoreA), W - 132, 23);
 
-    // Timer
-    const m = Math.floor(Math.max(0, timeLeft) / 60);
-    const s = Math.floor(Math.max(0, timeLeft) % 60);
-    const clock = m + ":" + String(s).padStart(2, "0");
-    ctx.fillStyle = timeLeft <= 15 && state === "play" ? "#ffd166" : "#e8f0e4";
-    ctx.font = "bold 20px Trebuchet MS, Consolas, monospace";
-    ctx.fillText(clock, W / 2, 23);
+    // Timer and half indicator
+    if (state === "play" || state === "goal") {
+      const m = Math.floor(Math.max(0, timeLeft) / 60);
+      const s = Math.floor(Math.max(0, timeLeft) % 60);
+      const clock = m + ":" + String(s).padStart(2, "0");
+      ctx.fillStyle = timeLeft <= 15 && state === "play" ? "#ffd166" : "#e8f0e4";
+      ctx.font = "bold 20px Trebuchet MS, Consolas, monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(clock, W / 2, 18);
+      
+      // Half indicator
+      ctx.fillStyle = "rgba(255,255,255,0.5)";
+      ctx.font = "11px Trebuchet MS, sans-serif";
+      ctx.fillText(currentHalf === 1 ? "1st Half" : "2nd Half", W / 2, 30);
+    }
 
     // Kick charge
     if (state === "play" && (charging || charge > 0)) {
@@ -859,10 +1134,9 @@
   }
 
   function drawOverlay() {
-    if (state === "title") {
-      ctx.fillStyle = "rgba(4,12,6,0.62)";
+    if (state === "setup") {
+      ctx.fillStyle = "rgba(4,12,6,0.72)";
       ctx.fillRect(0, 0, W, H);
-      const pulse = 0.85 + Math.sin(titlePulse * 3) * 0.15;
 
       ctx.fillStyle = "#f4fff0";
       ctx.textAlign = "center";
@@ -870,23 +1144,107 @@
       ctx.font = "bold 86px Trebuchet MS, sans-serif";
       ctx.shadowColor = "rgba(40,180,70,0.45)";
       ctx.shadowBlur = 24;
-      ctx.fillText("SOCCER", W / 2, H * 0.36);
+      ctx.fillText("SOCCER", W / 2, H * 0.22);
       ctx.shadowBlur = 0;
 
       ctx.fillStyle = "#9ae08a";
       ctx.font = "italic 22px Trebuchet MS, sans-serif";
-      ctx.fillText("KICKOFF", W / 2, H * 0.36 + 52);
+      ctx.fillText("KICKOFF", W / 2, H * 0.22 + 52);
 
-      ctx.globalAlpha = pulse;
-      ctx.fillStyle = "#ffffff";
-      ctx.font = "bold 20px Trebuchet MS, sans-serif";
-      ctx.fillText("Press  SPACE  or  click  to play", W / 2, H * 0.68);
-      ctx.globalAlpha = 1;
+      if (setupPhase === "team") {
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "bold 24px Trebuchet MS, sans-serif";
+        ctx.fillText("SELECT YOUR TEAM", W / 2, H * 0.42);
 
-      ctx.fillStyle = "rgba(220,240,220,0.55)";
-      ctx.font = "13px Trebuchet MS, sans-serif";
-      ctx.fillText("Move  WASD / arrows     Kick  Space (hold to charge)     Sprint  Shift", W / 2, H * 0.78);
-      ctx.fillText("3:00  ·  first whistle to last  ·  you are HOME in blue", W / 2, H * 0.84);
+        // Home option
+        const homeX = W / 2 - 140;
+        const homeY = H * 0.55;
+        ctx.fillStyle = selectedTeam === "home" ? "#2b6cff" : "rgba(43,108,255,0.4)";
+        roundRect(homeX - 70, homeY - 30, 140, 60, 8);
+        ctx.fill();
+        if (selectedTeam === "home") {
+          ctx.strokeStyle = "#fff";
+          ctx.lineWidth = 3;
+          ctx.stroke();
+        }
+        ctx.fillStyle = "#fff";
+        ctx.font = "bold 20px Trebuchet MS, sans-serif";
+        ctx.fillText("HOME", homeX, homeY);
+        ctx.font = "14px Trebuchet MS, sans-serif";
+        ctx.fillStyle = "rgba(255,255,255,0.8)";
+        ctx.fillText("Blue", homeX, homeY + 20);
+
+        // Away option
+        const awayX = W / 2 + 140;
+        const awayY = H * 0.55;
+        ctx.fillStyle = selectedTeam === "away" ? "#c62828" : "rgba(198,40,40,0.4)";
+        roundRect(awayX - 70, awayY - 30, 140, 60, 8);
+        ctx.fill();
+        if (selectedTeam === "away") {
+          ctx.strokeStyle = "#fff";
+          ctx.lineWidth = 3;
+          ctx.stroke();
+        }
+        ctx.fillStyle = "#fff";
+        ctx.font = "bold 20px Trebuchet MS, sans-serif";
+        ctx.fillText("AWAY", awayX, awayY);
+        ctx.font = "14px Trebuchet MS, sans-serif";
+        ctx.fillStyle = "rgba(255,255,255,0.8)";
+        ctx.fillText("Red", awayX, awayY + 20);
+
+        ctx.fillStyle = "rgba(255,255,255,0.6)";
+        ctx.font = "15px Trebuchet MS, sans-serif";
+        ctx.fillText("Use  A / D  or  arrows  to choose", W / 2, H * 0.72);
+
+        const pulse = 0.85 + Math.sin(titlePulse * 3) * 0.15;
+        ctx.globalAlpha = pulse;
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "bold 18px Trebuchet MS, sans-serif";
+        ctx.fillText("Press  SPACE  or  click  to continue", W / 2, H * 0.82);
+        ctx.globalAlpha = 1;
+
+      } else if (setupPhase === "difficulty") {
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "bold 24px Trebuchet MS, sans-serif";
+        ctx.fillText("SELECT DIFFICULTY", W / 2, H * 0.42);
+
+        const levels = ["easy", "normal", "hard"];
+        const levelLabels = ["EASY", "NORMAL", "HARD"];
+        const levelDescs = ["Casual", "Balanced", "Challenge"];
+        const levelColors = ["#5fb35f", "#ffa726", "#e63946"];
+        
+        for (let i = 0; i < 3; i++) {
+          const lx = W / 2 + (i - 1) * 160;
+          const ly = H * 0.55;
+          const level = levels[i];
+          
+          ctx.fillStyle = selectedDifficulty === level ? levelColors[i] : `rgba(${level === "easy" ? "95,179,95" : level === "normal" ? "255,167,38" : "230,57,70"},0.4)`;
+          roundRect(lx - 60, ly - 30, 120, 60, 8);
+          ctx.fill();
+          if (selectedDifficulty === level) {
+            ctx.strokeStyle = "#fff";
+            ctx.lineWidth = 3;
+            ctx.stroke();
+          }
+          ctx.fillStyle = "#fff";
+          ctx.font = "bold 18px Trebuchet MS, sans-serif";
+          ctx.fillText(levelLabels[i], lx, ly);
+          ctx.font = "13px Trebuchet MS, sans-serif";
+          ctx.fillStyle = "rgba(255,255,255,0.8)";
+          ctx.fillText(levelDescs[i], lx, ly + 20);
+        }
+
+        ctx.fillStyle = "rgba(255,255,255,0.6)";
+        ctx.font = "15px Trebuchet MS, sans-serif";
+        ctx.fillText("Use  A / D  or  arrows  to choose", W / 2, H * 0.72);
+
+        const pulse = 0.85 + Math.sin(titlePulse * 3) * 0.15;
+        ctx.globalAlpha = pulse;
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "bold 18px Trebuchet MS, sans-serif";
+        ctx.fillText("Press  SPACE  or  click  to start", W / 2, H * 0.82);
+        ctx.globalAlpha = 1;
+      }
     }
 
     if (state === "goal") {
@@ -906,6 +1264,33 @@
       ctx.fillStyle = lastScorer === "home" ? "#9ec0ff" : "#ff9a9a";
       ctx.fillText(lastScorer === "home" ? "HOME" : "AWAY", W / 2, H * 0.46 + 48);
       ctx.restore();
+    }
+
+    if (state === "halftime") {
+      ctx.fillStyle = "rgba(4,10,6,0.75)";
+      ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = "#f4fff0";
+      ctx.font = "bold 56px Trebuchet MS, sans-serif";
+      ctx.shadowColor = "rgba(100,200,120,0.5)";
+      ctx.shadowBlur = 18;
+      ctx.fillText("HALF TIME", W / 2, H * 0.36);
+      ctx.shadowBlur = 0;
+      
+      ctx.font = "bold 48px Trebuchet MS, sans-serif";
+      ctx.fillText(scoreH + "  –  " + scoreA, W / 2, H * 0.50);
+      
+      ctx.fillStyle = "rgba(255,255,255,0.7)";
+      ctx.font = "18px Trebuchet MS, sans-serif";
+      ctx.fillText("Teams switch ends", W / 2, H * 0.62);
+      
+      const pulse = 0.85 + Math.sin(titlePulse * 3) * 0.15;
+      ctx.globalAlpha = pulse;
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 18px Trebuchet MS, sans-serif";
+      ctx.fillText("Press  SPACE  or  click  for second half", W / 2, H * 0.74);
+      ctx.globalAlpha = 1;
     }
 
     if (state === "over") {
@@ -945,14 +1330,24 @@
       timeLeft -= dt;
       if (timeLeft <= 0) {
         timeLeft = 0;
-        state = "over";
-        sfxWhistle();
+        if (currentHalf === 1) {
+          state = "halftime";
+          sfxWhistle();
+        } else {
+          state = "over";
+          sfxWhistle();
+        }
       } else {
         updateHuman(dt);
         updateAI(dt);
-        collidePlayers(home, away);
-        collideBallPlayer(home);
-        collideBallPlayer(away);
+        
+        const allPlayers = [...homePlayers, ...awayPlayers];
+        collidePlayers(allPlayers);
+        
+        for (const p of allPlayers) {
+          collideBallPlayer(p);
+        }
+        
         updateBall(dt);
       }
     } else if (state === "goal") {
@@ -974,28 +1369,24 @@
       ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
     }
     drawPitch();
-    if (state !== "title") {
-      drawPlayer(home, "#1d4ed8", "#60a5fa");
-      drawPlayer(away, "#b91c1c", "#f87171");
-      drawBall();
-    } else {
-      // Attract mode silhouettes
-      home.x = PITCH.x + PITCH.w * 0.35;
-      home.y = PITCH.y + PITCH.h * 0.55;
-      home.facing = 0.15;
-      away.x = PITCH.x + PITCH.w * 0.62;
-      away.y = PITCH.y + PITCH.h * 0.48;
-      away.facing = Math.PI + 0.2;
-      ball.x = PITCH.x + PITCH.w * 0.5 + Math.sin(titlePulse) * 18;
-      ball.y = PITCH.y + PITCH.h * 0.5 + Math.cos(titlePulse * 0.8) * 10;
-      drawPlayer(home, "#1d4ed8", "#60a5fa");
-      drawPlayer(away, "#b91c1c", "#f87171");
+    
+    if (state !== "setup") {
+      // Draw all players
+      for (const p of homePlayers) {
+        drawPlayer(p, "#1d4ed8", "#60a5fa", p === controlledPlayer);
+      }
+      for (const p of awayPlayers) {
+        drawPlayer(p, "#b91c1c", "#f87171", p === controlledPlayer);
+      }
       drawBall();
     }
+    
     drawParticles();
     ctx.restore();
 
-    drawHUD();
+    if (state !== "setup") {
+      drawHUD();
+    }
     drawOverlay();
 
     requestAnimationFrame(frame);
